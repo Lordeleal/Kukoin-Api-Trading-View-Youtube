@@ -38,29 +38,71 @@ const sleep = (timeMs) => new Promise(resolve => setTimeout(resolve, timeMs))
 
 
 ///////////////////////////// Short 
+// Función para esperar un tiempo definido
+function wait(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Función para obtener la orden con reintentos
+async function getOrderWithRetry(client, orderId, retries = 5, delay = 2000) {
+    for (let i = 0; i < retries; i++) {
+        const order = await client.getOrderById({ oid: orderId });
+        if (order && order.data && order.data.filledValue && order.data.filledSize) {
+            return order; // Retorna la orden si está disponible
+        }
+        console.log(`Reintento ${i + 1}: La orden aún no está disponible, esperando ${delay}ms...`);
+        await wait(delay); // Esperar antes del siguiente intento
+    }
+    throw new Error(`No se pudo obtener la orden ${orderId} después de ${retries} intentos.`);
+}
+
+// Función principal ajustada
+// Función para esperar un tiempo definido
+function wait(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Función para obtener la orden con reintentos
+async function getOrderWithRetry(client, orderId, retries = 5, delay = 2000) {
+    for (let i = 0; i < retries; i++) {
+        const order = await client.getOrderById({ oid: orderId });
+        if (order && order.data && order.data.filledValue && order.data.filledSize) {
+            return order; // Retorna la orden si está disponible
+        }
+        console.log(`Reintento ${i + 1}: La orden aún no está disponible, esperando ${delay}ms...`);
+        await wait(delay); // Esperar antes del siguiente intento
+    }
+    throw new Error(`No se pudo obtener la orden ${orderId} después de ${retries} intentos.`);
+}
+
+// Función principal ajustada
+
 
 async function placeShortPosition() {
     cancel4();
     await sleep(4000);
-    const contracts = await client.getAllContracts()
-    const contract = contracts.data.find(contract => contract.baseCurrency === PAIR1 &&
-        contract.quoteCurrency === PAIR2)
 
-    var { price, pricePlace, lotSize, multiplier } = {
+    const contracts = await client.getAllContracts();
+    const contract = contracts.data.find(contract => contract.baseCurrency === PAIR1 &&
+        contract.quoteCurrency === PAIR2);
+
+    const { price, pricePlace, lotSize, multiplier, tickSize } = {
         price: contract.markPrice,
         pricePlace: contract.markPrice.toString().includes('.')
             ? contract.markPrice.toString().split('.')[1].length : 0,
         lotSize: contract.lotSize,
-        tickSize: contract.indexPriceTickSize,
-        multiple: contract.tickSize,
-        multiplier: contract.multiplier
-    }
+        multiplier: contract.multiplier,
+        tickSize: contract.tickSize,
+    };
 
-    const amountBuyPAIR2 = AMOUNT * LEVERAGE
+    console.log('Datos del contrato:', { price, pricePlace, lotSize, multiplier, tickSize });
 
-    const amountBuyPAIR1 = parseFloat(amountBuyPAIR2) / parseFloat(price)
+    // Calcular la cantidad a comprar en PAIR2
+    const amountBuyPAIR2 = AMOUNT * LEVERAGE;
+    const amountBuyPAIR1 = parseFloat(amountBuyPAIR2) / parseFloat(price);
+    const size = parseInt((lotSize * amountBuyPAIR1) / multiplier);
 
-    const size = parseInt((lotSize * amountBuyPAIR1) / multiplier)
+    // Realizar la orden de venta (short)
     const SellOrder = await client.placeOrder({
         clientOid: uuidv4(),
         symbol: contract.symbol,
@@ -68,64 +110,114 @@ async function placeShortPosition() {
         type: 'market',
         leverage: LEVERAGE,
         size,
-    })
+    });
 
     if ('data' in SellOrder && 'orderId' in SellOrder.data) {
-        var order = await client.getOrderById({ oid: SellOrder.data.orderId })
-        const buyPrice = parseFloat((order.data.filledValue / order.data.filledSize)
-            / multiplier).toFixed(pricePlace)
-        /// short
-        var sl = parseFloat(parseFloat(buyPrice)
-        + (parseFloat(buyPrice) * STOP_LOSS_PERCENT / 100)).toFixed(pricePlace)
+        console.log('Orden realizada:', SellOrder.data.orderId);
 
-        var tp = parseFloat(parseFloat(buyPrice)
-        - (parseFloat(buyPrice) * TAKE_PROFIT_PERCENT / 100)).toFixed(pricePlace)
+        try {
+            // Intentar obtener la orden con reintentos
+            const order = await getOrderWithRetry(client, SellOrder.data.orderId);
 
-            
+            // Calcular el precio de compra promedio
+            const buyPrice = parseFloat((order.data.filledValue / order.data.filledSize) / multiplier).toFixed(pricePlace);
+            console.log('buyPrice calculado:', buyPrice);
 
-        await sleep(1000)
+            // Calcular el Stop Loss (SL) y Take Profit (TP)
+            let sl = parseFloat(parseFloat(buyPrice) + (parseFloat(buyPrice) * STOP_LOSS_PERCENT / 100)).toFixed(pricePlace);
+            let tp = parseFloat(parseFloat(buyPrice) - (parseFloat(buyPrice) * TAKE_PROFIT_PERCENT / 100)).toFixed(pricePlace);
 
-        await client.placeOrder({
-            clientOid: uuidv4(),
-            symbol: contract.symbol,
-            side: 'sell',
-            stop: 'down',
-            stopPrice: tp,
-            stopPriceType: 'MP',
-            leverage: LEVERAGE,
-            type: 'market',
-            size,
-            closeOrder: true,
-        })
+            // Asegurarse de que el precio esté alineado con el tickSize
+            sl = Math.round(sl / tickSize) * tickSize;
+            tp = Math.round(tp / tickSize) * tickSize;
 
-        await client.placeOrder({
-            clientOid: uuidv4(),
-            symbol: contract.symbol,
-            side: 'sell',
-            stop: 'up',
-            stopPrice: sl,
-            stopPriceType: 'MP',
-            leverage: LEVERAGE,
-            type: 'market',
-            size,
-            closeOrder: true,
-        })
+            console.log('Stop Loss ajustado al tickSize:', sl);
+            console.log('Take Profit ajustado al tickSize:', tp);
+
+            // Realizar la orden de Stop Loss
+            await client.placeOrder({
+                clientOid: uuidv4(),
+                symbol: contract.symbol,
+                side: 'buy',
+                stop: 'up',
+                stopPrice: sl,
+                stopPriceType: 'MP',
+                leverage: LEVERAGE,
+                type: 'market',
+                size,
+                closeOrder: true,
+            });
+
+            // Realizar la orden de Take Profit
+            await client.placeOrder({
+                clientOid: uuidv4(),
+                symbol: contract.symbol,
+                side: 'buy',
+                stop: 'down',
+                stopPrice: tp,
+                stopPriceType: 'MP',
+                leverage: LEVERAGE,
+                type: 'market',
+                size,
+                closeOrder: true,
+            });
+        } catch (error) {
+            console.error('Error al obtener la orden después de múltiples intentos:', error.message);
+        }
     } else {
-        console.log('¡Order not executed!')
+        console.error('Error al realizar la orden de venta.');
     }
 }
 
 
 
+
+
+
+
 /////////////////////////////////////////long 
 
+// Función para esperar un tiempo definido
+function wait(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Función para cancelar órdenes de TP y SL existentes
+async function cancelExistingOrders(client, symbol, retries = 5, delay = 2000) {
+    try {
+        const orders = await client.getOrders({ symbol });
+        for (const order of orders.data) {
+            if (order.stop && (order.stop === 'up' || order.stop === 'down')) {
+                console.log(`Cancelando la orden con ID ${order.orderId}`);
+                await client.cancelOrder({ orderId: order.orderId });
+            }
+        }
+    } catch (error) {
+        console.error('Error al intentar cancelar órdenes existentes:', error.message);
+    }
+}
+
+// Función para obtener la orden con reintentos
+async function getOrderWithRetry(client, orderId, retries = 5, delay = 2000) {
+    for (let i = 0; i < retries; i++) {
+        const order = await client.getOrderById({ oid: orderId });
+        if (order && order.data && order.data.filledValue && order.data.filledSize) {
+            return order; // Retorna la orden si está disponible
+        }
+        console.log(`Reintento ${i + 1}: La orden aún no está disponible, esperando ${delay}ms...`);
+        await wait(delay); // Esperar antes del siguiente intento
+    }
+    throw new Error(`No se pudo obtener la orden ${orderId} después de ${retries} intentos.`);
+}
+
+// Función para colocar la orden de Long con TP y SL
 async function placeLongPosition() {
-    
     cancel4();
-    await sleep(4000);
-    const contracts = await client.getAllContracts()
+    await wait(4000);
+
+    const contracts = await client.getAllContracts();
     const contract = contracts.data.find(contract => contract.baseCurrency === PAIR1 &&
-        contract.quoteCurrency === PAIR2)
+        contract.quoteCurrency === PAIR2);
 
     var { price, pricePlace, lotSize, multiplier } = {
         price: contract.markPrice,
@@ -135,13 +227,13 @@ async function placeLongPosition() {
         tickSize: contract.indexPriceTickSize,
         multiple: contract.tickSize,
         multiplier: contract.multiplier
-    }
+    };
 
-    const amountBuyPAIR2 = AMOUNT * LEVERAGE
+    const amountBuyPAIR2 = AMOUNT * LEVERAGE;
+    const amountBuyPAIR1 = parseFloat(amountBuyPAIR2) / parseFloat(price);
+    const size = parseInt((lotSize * amountBuyPAIR1) / multiplier);
 
-    const amountBuyPAIR1 = parseFloat(amountBuyPAIR2) / parseFloat(price)
-
-    const size = parseInt((lotSize * amountBuyPAIR1) / multiplier)
+    // Realizar la orden de compra (long)
     const BuyOrder = await client.placeOrder({
         clientOid: uuidv4(),
         symbol: contract.symbol,
@@ -149,50 +241,67 @@ async function placeLongPosition() {
         type: 'market',
         leverage: LEVERAGE,
         size,
-    })
+    });
 
     if ('data' in BuyOrder && 'orderId' in BuyOrder.data) {
-        var order = await client.getOrderById({ oid: BuyOrder.data.orderId })
-        const buyPrice = parseFloat((order.data.filledValue / order.data.filledSize)
-            / multiplier).toFixed(pricePlace)
-        ///// long 
-        var tp = parseFloat(parseFloat(buyPrice)
-            + (parseFloat(buyPrice) * TAKE_PROFIT_PERCENT / 100)).toFixed(pricePlace)
+        let order;
+        try {
+            // Intentar obtener la orden de compra por ID
+            order = await getOrderWithRetry(client, BuyOrder.data.orderId);
+            const buyPrice = parseFloat((order.data.filledValue / order.data.filledSize)
+                / multiplier).toFixed(pricePlace);
 
-        var sl = parseFloat(parseFloat(buyPrice)
-            - (parseFloat(buyPrice) * STOP_LOSS_PERCENT / 100)).toFixed(pricePlace)
+            // Calcular el Take Profit (TP) y Stop Loss (SL)
+            let tp = parseFloat(parseFloat(buyPrice)
+                + (parseFloat(buyPrice) * TAKE_PROFIT_PERCENT / 100)).toFixed(pricePlace);
+            let sl = parseFloat(parseFloat(buyPrice)
+                - (parseFloat(buyPrice) * STOP_LOSS_PERCENT / 100)).toFixed(pricePlace);
 
-       
+            console.log('TP calculado:', tp);
+            console.log('SL calculado:', sl);
 
-        await sleep(1000)
+            // Cancelar las órdenes existentes de TP y SL antes de colocar nuevas
+            await cancelExistingOrders(client, contract.symbol);
 
-        await client.placeOrder({
-            clientOid: uuidv4(),
-            symbol: contract.symbol,
-            side: 'sell',
-            stop: 'up',
-            stopPrice: tp,
-            stopPriceType: 'MP',
-            leverage: LEVERAGE,
-            type: 'market',
-            size,
-            closeOrder: true,
-        })
+            // Colocar órdenes de Stop Loss y Take Profit
+            await wait(1000); // Esperar un poco antes de colocar las órdenes
 
-        await client.placeOrder({
-            clientOid: uuidv4(),
-            symbol: contract.symbol,
-            side: 'sell',
-            stop: 'down',
-            stopPrice: sl,
-            stopPriceType: 'MP',
-            leverage: LEVERAGE,
-            type: 'market',
-            size,
-            closeOrder: true,
-        })
+            await client.placeOrder({
+                clientOid: uuidv4(),
+                symbol: contract.symbol,
+                side: 'sell',
+                stop: 'up',
+                stopPrice: tp,
+                stopPriceType: 'MP',
+                leverage: LEVERAGE,
+                type: 'market',
+                size,
+                closeOrder: true,
+            });
+
+            await client.placeOrder({
+                clientOid: uuidv4(),
+                symbol: contract.symbol,
+                side: 'sell',
+                stop: 'down',
+                stopPrice: sl,
+                stopPriceType: 'MP',
+                leverage: LEVERAGE,
+                type: 'market',
+                size,
+                closeOrder: true,
+            });
+
+        } catch (error) {
+            console.error('Error al obtener la orden de compra:', error.message);
+
+            // Si no se puede obtener la orden, intentar esperar y reintentar
+            console.log('Esperando 5 segundos antes de reintentar...');
+            await wait(5000);
+            await placeLongPosition(); // Volver a intentar
+        }
     } else {
-        console.log('¡Order not executed!')
+        console.log('¡Orden no ejecutada!');
     }
 }
 
@@ -376,7 +485,7 @@ const cancelall = async (attemps = 0) => {
             return checkOrdersStatus(++attemps)
     }
 }
-
+/// Suscribete 
 //StopShort();
 //StopLong();
 //placeShortPosition()
@@ -420,74 +529,3 @@ StopShortkoin =function(){
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-async function ordergoo44548(){
-    var order = await client.getOrderById({ oid: BuyOrder.data.orderId })
-        const buyPrice = parseFloat((order.data.filledValue / order.data.filledSize)
-            / multiplier).toFixed(pricePlace)
-
-            TAKE_PROFIT_PERCENT4close= buyPrice
-            STOP_LOSS_PERCENT4close = buyPrice
-
-        var tp = parseFloat(parseFloat(buyPrice)
-            + (parseFloat(buyPrice) * TAKE_PROFIT_PERCENT4close / 100)).toFixed(pricePlace)
-
-        var sl = parseFloat(parseFloat(buyPrice)
-            - (parseFloat(buyPrice) * TAKE_PROFIT_PERCENT4close / 100)).toFixed(pricePlace)
-
-        client.initSocket({ topic: "advancedOrders", symbols: [`${PAIR1}-${PAIR2}`] }, (msg) => {
-            const res = JSON.parse(msg)
-            if ('data' in res) {
-
-                process.exit()
-                const order = res.data
-                console.log(order.orderId, ': ', order.stop, order.type)
-                if (order.type === 'triggered') {
-                   /// checkOrdersStatus()
-                   process.exit()
-                } else if (order.type === 'cancel') {
-                    process.exit()
-                }
-            }
-        })
-
-        await sleep(1000)
-
-        await client.placeOrder({
-            clientOid: uuidv4(),
-            symbol: contract.symbol,
-            side: 'sell',
-            stop: 'up',
-            stopPrice: tp,
-            stopPriceType: 'MP',
-            leverage: LEVERAGE,
-            type: 'market',
-            size,
-            closeOrder: true,
-        })
-
-        await client.placeOrder({
-            clientOid: uuidv4(),
-            symbol: contract.symbol,
-            side: 'sell',
-            stop: 'down',
-            stopPrice: sl,
-            stopPriceType: 'MP',
-            leverage: LEVERAGE,
-            type: 'market',
-            size,
-            closeOrder: true,
-        })
-}
